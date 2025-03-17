@@ -33,7 +33,7 @@ if USE_GPU:
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 EMBEDDING_DIMENSION = 768  # Dimension for the embedding model
 EMBEDDING_BATCH_SIZE = 32  # Process embeddings in batches
-FAISS_INDEX_TYPE = "IVFFlat"  # Use IVFFlat for larger datasets with GPU
+FAISS_INDEX_TYPE = "Flat"  # Use IVFFlat for larger datasets with GPU
 
 # LLM settings
 DEFAULT_LLM_MODEL = "llama-3.3-70b-specdec"

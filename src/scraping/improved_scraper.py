@@ -439,185 +439,213 @@ class EnhancedWebScraper:
     
     async def process_urls(self, urls: List[str]) -> Dict[str, Any]:
         """
-        Process a list of URLs concurrently with improved error handling and detailed reporting.
-        """
-        # Deduplicate URLs
-        unique_urls = [url for url in urls if url not in self.processed_urls]
-        logger.info(f"Processing {len(unique_urls)} unique URLs out of {len(urls)} total URLs")
+        Process a list of URLs concurrently with improved error handling.
         
-        # Create a semaphore to limit concurrency
+        Args:
+            urls: List of URLs to process
+            
+        Returns:
+            Dictionary containing results and statistics
+        """
+        if not urls:
+            logger.warning("No URLs provided to process")
+            return {
+                "total_urls": 0,
+                "successful_count": 0,
+                "failed_count": 0,
+                "documents": [],
+                "errors": {}
+            }
+            
+        logger.info(f"Starting to process {len(urls)} URLs with max concurrency of {self.max_concurrent}")
+        
+        # Initialize statistics
+        total_urls = len(urls)
+        successful_count = 0
+        failed_count = 0
+        documents = []
+        errors = {}
+        
+        # Create semaphore for concurrency control
         semaphore = asyncio.Semaphore(self.max_concurrent)
         
-        # Keep track of successful and failed URLs
-        results = {
-            'successful': [],
-            'failed': [],
-            'start_time': datetime.now().isoformat(),
-            'end_time': None,
-            'documents': [],  # Store Document objects for vector store
-            'error_stats': {}  # Store error statistics
-        }
+        # Configure aiohttp session with longer timeout and keep-alive
+        timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent, force_close=False, enable_cleanup_closed=True)
         
-        # Configure aiohttp client session with improved settings
-        conn = aiohttp.TCPConnector(
-            limit=self.max_concurrent,
-            ssl=False,  # More permissive SSL handling
-            ttl_dns_cache=300  # Cache DNS lookups
-        )
-        timeout = aiohttp.ClientTimeout(total=60, connect=10)
-        
-        # Create session with improved settings
-        async with aiohttp.ClientSession(
-            connector=conn, 
-            timeout=timeout,
-            cookie_jar=aiohttp.CookieJar()  # Handle cookies for better site compatibility
-        ) as session:
-            # Process URLs in chunks to avoid overwhelming servers
-            chunk_size = 5  # Process 5 URLs at a time
-            for i in range(0, len(unique_urls), chunk_size):
-                chunk = unique_urls[i:i+chunk_size]
-                logger.info(f"Processing URL chunk {i//chunk_size + 1}/{(len(unique_urls) - 1) // chunk_size + 1}")
-                
-                # Create tasks for this chunk
-                tasks = [self.fetch_content(session, url, semaphore, follow_redirects=self.follow_redirects) for url in chunk]
-                
-                # Process tasks
-                for task in asyncio.as_completed(tasks):
-                    result = await task
-                    url = result['url']
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            # Create tasks for all URLs
+            tasks = []
+            for url in urls:
+                if url not in self.processed_urls:  # Skip already processed URLs
+                    tasks.append(self.fetch_content(session, url, semaphore))
                     self.processed_urls.add(url)
+            
+            if not tasks:
+                logger.warning("No new URLs to process (all URLs have been processed before)")
+                return {
+                    "total_urls": total_urls,
+                    "successful_count": 0,
+                    "failed_count": 0,
+                    "documents": [],
+                    "errors": {}
+                }
+            
+            # Process URLs concurrently and gather results
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Task failed with exception: {str(result)}")
+                        failed_count += 1
+                        continue
+                        
+                    if not result:
+                        logger.warning("Empty result received")
+                        failed_count += 1
+                        continue
+                        
+                    url = result.get('url', 'unknown_url')
                     
-                    # Track error by type for diagnostics
                     if 'error' in result:
-                        error_type = result.get('error', '').split(':', 1)[0]
-                        if not error_type:
-                            error_type = "Unknown"
+                        logger.warning(f"Error processing {url}: {result['error']}")
+                        failed_count += 1
+                        errors[url] = result['error']
+                        continue
                         
-                        if error_type not in results['error_stats']:
-                            results['error_stats'][error_type] = 0
-                        results['error_stats'][error_type] += 1
-                    
-                    # Handle failed URLs
-                    if 'error' in result and 'html' not in result:
-                        error_entry = {
-                            'url': url,
-                            'error': result['error'],
-                            'status': result.get('status'),
-                            'timestamp': result['timestamp']
-                        }
-                        
-                        results['failed'].append(error_entry)
-                        
-                        # Save detailed error info
-                        error_filename = self.get_safe_filename(url)
-                        error_file = os.path.join(self.error_dir, f"{error_filename}_error.json")
-                        with open(error_file, 'w', encoding='utf-8') as f:
-                            json.dump(error_entry, f, indent=2)
-                        
-                        logger.warning(f"Failed to fetch: {url} - {result['error']}")
+                    if 'html' not in result:
+                        logger.warning(f"No HTML content in result for {url}")
+                        failed_count += 1
+                        errors[url] = "No HTML content in response"
                         continue
                     
-                    # Process HTML content
-                    if 'html' in result:
-                        # Extract text content
+                    try:
+                        # Extract text from HTML
                         text = self.extract_text_from_html(result['html'], url)
                         
-                        # Skip pages with insufficient content
-                        if not text or len(text) < self.min_text_length:
-                            error_entry = {
-                                'url': url,
-                                'error': f'Insufficient content (length: {len(text)})',
-                                'status': result.get('status'),
-                                'timestamp': result['timestamp']
-                            }
-                            
-                            results['failed'].append(error_entry)
-                            
-                            # Track this error type
-                            if 'Insufficient content' not in results['error_stats']:
-                                results['error_stats']['Insufficient content'] = 0
-                            results['error_stats']['Insufficient content'] += 1
-                            
-                            logger.warning(f"Insufficient content: {url} (length: {len(text)})")
+                        if len(text.strip()) < self.min_text_length:
+                            logger.warning(f"Extracted text too short for {url}")
+                            failed_count += 1
+                            errors[url] = "Extracted text too short"
                             continue
                         
-                        # Create safe filename
-                        filename = self.get_safe_filename(url)
-                        
-                        # Save text content
-                        text_file = os.path.join(self.text_dir, f"{filename}.txt")
-                        with open(text_file, 'w', encoding='utf-8') as f:
-                            f.write(text)
-                        
-                        # Save metadata
+                        # Create document
                         metadata = {
-                            'url': url,
-                            'status': result['status'],
+                            'source': url,
                             'timestamp': result['timestamp'],
-                            'headers': result['headers'],
-                            'text_length': len(text),
-                            'filename': f"{filename}.txt"
+                            'title': self.extract_title(result['html']) or url,
                         }
                         
-                        metadata_file = os.path.join(self.metadata_dir, f"{filename}_metadata.json")
-                        with open(metadata_file, 'w', encoding='utf-8') as f:
-                            json.dump(metadata, f, indent=2)
-                        
-                        # Create Document object for vector store
-                        doc = Document(
+                        document = Document(
                             page_content=text,
-                            metadata={
-                                'source': url,
-                                'timestamp': result['timestamp'],
-                                'filename': f"{filename}.txt"
-                            }
+                            metadata=metadata
                         )
                         
-                        # Add to documents list
-                        results['documents'].append(doc)
+                        documents.append(document)
+                        successful_count += 1
                         
-                        results['successful'].append({
-                            'url': url,
-                            'text_file': text_file,
-                            'metadata_file': metadata_file,
-                            'text_length': len(text)
-                        })
+                        # Save content and metadata
+                        self.save_content(url, text, metadata)
                         
-                        logger.info(f"Successfully processed: {url} (text length: {len(text)})")
+                    except Exception as e:
+                        logger.error(f"Error processing content from {url}: {str(e)}")
+                        failed_count += 1
+                        errors[url] = f"Content processing error: {str(e)}"
                 
-                # Add a small delay between chunks to avoid overwhelming servers
-                if i + chunk_size < len(unique_urls):
-                    await asyncio.sleep(2 * random.uniform(0.8, 1.2))
+            except Exception as e:
+                logger.error(f"Error during concurrent processing: {str(e)}")
+                return {
+                    "total_urls": total_urls,
+                    "successful_count": successful_count,
+                    "failed_count": failed_count + len(tasks) - successful_count,
+                    "documents": documents,
+                    "errors": {**errors, "concurrent_processing_error": str(e)}
+                }
         
-        # Save overall results
-        results['end_time'] = datetime.now().isoformat()
-        results['total_urls'] = len(unique_urls)
-        results['successful_count'] = len(results['successful'])
-        results['failed_count'] = len(results['failed'])
-        results['error_counts'] = self.error_counts
+        # Log final statistics
+        logger.info(f"Processing completed:")
+        logger.info(f"Total URLs: {total_urls}")
+        logger.info(f"Successfully processed: {successful_count}")
+        logger.info(f"Failed: {failed_count}")
+        if errors:
+            logger.info(f"Error types encountered: {list(set(errors.values()))}")
         
-        # Calculate success rate
-        if len(unique_urls) > 0:
-            results['success_rate'] = results['successful_count'] / len(unique_urls) * 100
-        else:
-            results['success_rate'] = 0
+        return {
+            "total_urls": total_urls,
+            "successful_count": successful_count,
+            "failed_count": failed_count,
+            "documents": documents,
+            "errors": errors
+        }
+    
+    def extract_title(self, html: str) -> Optional[str]:
+        """
+        Extract the title from HTML content.
         
-        # Generate error summary
-        error_summary = os.path.join(self.output_dir, 'error_summary.json')
-        with open(error_summary, 'w', encoding='utf-8') as f:
-            json.dump({
-                'error_counts': self.error_counts,
-                'error_stats': results['error_stats'],
-                'success_rate': results['success_rate'],
-                'timestamp': datetime.now().isoformat()
-            }, f, indent=2)
+        Args:
+            html: HTML content to extract title from
+            
+        Returns:
+            Title string if found, None otherwise
+        """
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Try to get title from meta tags first
+            meta_title = soup.find('meta', property='og:title')
+            if meta_title and meta_title.get('content'):
+                return meta_title['content'].strip()
+            
+            # Try article title
+            article_title = soup.find('h1', class_=lambda x: x and 'title' in x.lower())
+            if article_title:
+                return article_title.get_text().strip()
+            
+            # Fall back to regular title tag
+            title_tag = soup.title
+            if title_tag:
+                return title_tag.string.strip()
+            
+            return None
+        except Exception as e:
+            logger.warning(f"Error extracting title: {str(e)}")
+            return None
+    
+    def save_content(self, url: str, text: str, metadata: Dict[str, Any]) -> None:
+        """
+        Save extracted content and metadata to files.
         
-        # Generate extraction summary
-        summary_path = os.path.join(self.output_dir, 'extraction_summary.json')
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump({k: v for k, v in results.items() if k != 'documents'}, f, indent=2)
-        
-        logger.info(f"Extraction complete: {results['successful_count']} successful ({results['success_rate']:.1f}%), {results['failed_count']} failed")
-        logger.info(f"Error summary: {results['error_stats']}")
-        
-        return results
+        Args:
+            url: Source URL
+            text: Extracted text content
+            metadata: Metadata dictionary
+        """
+        try:
+            # Create safe filename from URL
+            filename = self.get_safe_filename(url)
+            
+            # Save text content
+            text_file = os.path.join(self.text_dir, f"{filename}.txt")
+            with open(text_file, 'w', encoding='utf-8') as f:
+                f.write(text)
+            
+            # Add file information to metadata
+            metadata.update({
+                'text_file': text_file,
+                'text_length': len(text),
+                'extraction_time': datetime.now().isoformat()
+            })
+            
+            # Save metadata
+            metadata_file = os.path.join(self.metadata_dir, f"{filename}_metadata.json")
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.debug(f"Saved content and metadata for {url}")
+            
+        except Exception as e:
+            logger.error(f"Error saving content for {url}: {str(e)}")
+            # Don't raise the exception - we don't want to fail the whole process
+            # The document is already created and will be returned in the results
